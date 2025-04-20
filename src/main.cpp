@@ -12,6 +12,21 @@
 #define ENCODER_PULSES_PER_REV 16  // Liczba impulsów na pełny obrót enkodera
 #define GEAR_RATIO 9.6             // Przekładnia 9.6
 
+#define START_BYTE 0xA5  // Początek ramki
+#define FRAME_LENGTH 23  // Długość danych w ramce
+
+// Struktura do przechowywania danych
+struct DataFrame {
+    uint8_t startByte;  // Start byte
+    uint8_t length;     // Długość ramki
+    float rpm;          // Prędkość
+    int pwm;            // PWM
+    float current;      // Prąd
+    float voltage;      // Napięcie
+    float power;        // Moc
+    uint8_t checksum;   // Checksum
+};
+
 // Kierunek obrotu
 enum Direction { LEFT, RIGHT };
 
@@ -46,20 +61,24 @@ float eprev = 0;
 // Deklaracje funkcji
 void read_encoder();
 void IRAM_ATTR set_motor(Direction, int, int, int, int);
+void send_qt_binary(float, int, float, float, float);
+void debug_data(uint8_t *,size_t length);
+// Funkcja obliczająca checksum (XOR wszystkich bajtów)
+uint8_t calculate_checksum(uint8_t *, int);
 
 void setup() {
     Serial.begin(115200);
     Wire.begin();
-    while (!ina219.begin()) {
-        Serial.println("Failed to find INA219 chip");
-        delay(100);
-    }
+    // while (!ina219.begin()) {
+    //     Serial.println("Failed to find INA219 chip");
+    //     delay(100);
+    // }
     pinMode(ENCODER_AY, INPUT);
     pinMode(ENCODER_BG, INPUT);
     pinMode(IN1, OUTPUT);
     pinMode(IN2, OUTPUT);
     attachInterrupt(digitalPinToInterrupt(ENCODER_AY), read_encoder, RISING);
-    ina219.setCalibration_32V_1A();
+    // ina219.setCalibration_32V_1A();
     delay(500);
 }
 
@@ -84,15 +103,16 @@ void loop() {
     float v1 = velocity1 / GEAR_RATIO * ENCODER_PULSES_PER_REV * 60;
 
     // Filtrowanie dolnoprzepustowe (5 Hz)
-    v1_filt = 1.5610 * v1_filt - 0.6414 * v2_filt + 0.0201 * v1 + 0.0402 * v1_prev + 0.0201 * v2_prev;
+    v1_filt =
+        1.5610 * v1_filt - 0.6414 * v2_filt + 0.0201 * v1 + 0.0402 * v1_prev + 0.0201 * v2_prev;
     v2_filt = v1_filt;
     v2_prev = v1_prev;
     v1_prev = v1;
 
     // Wartość zadana prędkości (150 RPM sinusoidalnie zmieniana) taki przebieg prostokątny
     float vt = 150 * (sin(curr_t / 1e6) > 0);
-    Serial.print(">v_target:");
-    Serial.println(vt);
+    // Serial.print(">v_target:");
+    // Serial.println(vt);
     // Parametry PID
     float kp = 1;
     float ki = 1;
@@ -130,14 +150,14 @@ void loop() {
     // Serial.print(">EM_green:");
     // Serial.println(5 * b);
 
-    // shuntvoltage = ina219.getShuntVoltage_mV();
-    bus_voltage = ina219.getBusVoltage_V();
+    // shunt_voltage = ina219.getShuntVoltage_mV();
+    // bus_voltage = ina219.getBusVoltage_V();
     // current_mA = ina219.getCurrent_mA();
     // power_mW = ina219.getPower_mW();
-    // loadvoltage = busvoltage + (shuntvoltage / 1000);
+    float loadvoltage = bus_voltage + (shunt_voltage / 1000);
 
-    Serial.print(">Bus voltage:");
-    Serial.println(bus_voltage);
+    // Serial.print(">Bus voltage:");
+    // Serial.println(bus_voltage);
     // Serial.println(" V");
     // Serial.print("Shunt voltage:       ");
     // Serial.print(shuntvoltage);
@@ -152,7 +172,10 @@ void loop() {
     // Serial.println(power_mW);
     // Serial.println(" mW");
     // Serial.println("");
-    delay(1);
+
+    // Transmisja danych do Qt
+    send_qt_binary(v1_filt, pwr, current_mA, load_voltage, power_mW);
+    delay(200);
 }
 
 /*Czytamy enkoder b jak a będzie miało interupta na rising, jak kręcimy w
@@ -184,4 +207,57 @@ void set_motor(Direction dir, int pwm, int pwm_val, int in1, int in2) {
         digitalWrite(in1, LOW);
         digitalWrite(in2, LOW);
     }
+}
+
+void send_qt_binary(float rpm, int pwm, float current, float voltage, float power) {
+    // Przygotowanie ramki
+    DataFrame frame;
+    frame.startByte = START_BYTE;
+    frame.length = FRAME_LENGTH;
+    frame.rpm = rpm;
+    frame.pwm = pwm;
+    frame.current = current;
+    frame.voltage = voltage;
+    frame.power = power;
+    // 1 + 1 + 5*4 23
+    // Zbiór bajtów do wysłania
+    uint8_t buffer[FRAME_LENGTH]; // 23 bajty (start byte + długość + dane + checksum)
+
+    // Wartości są zapisywane jako little - endian najmniej znaczący bit pierszy 
+    // Kopiowanie danych do bufora
+    memcpy(buffer, &frame.startByte, sizeof(frame.startByte));   // Start byte
+    memcpy(buffer + 1, &frame.length, sizeof(frame.length));     // Długość ramki
+    memcpy(buffer + 2, &frame.rpm, sizeof(frame.rpm));           // RPM
+    memcpy(buffer + 6, &frame.pwm, sizeof(frame.pwm));           // PWM
+    memcpy(buffer + 10, &frame.current, sizeof(frame.current));   // Current
+    memcpy(buffer + 14, &frame.voltage, sizeof(frame.voltage)); // Voltage
+    memcpy(buffer + 18, &frame.power, sizeof(frame.power));     // Power
+
+    // Oblicz checksum
+    frame.checksum = calculate_checksum(buffer, sizeof(buffer) - 1); // -1 aby nie liczyć checksum
+
+    // Dodanie checksum do ramki
+    memcpy(buffer + sizeof(buffer) - 1, &frame.checksum, sizeof(frame.checksum));
+
+    // Wysyłanie ramki
+    Serial.write(buffer, sizeof(buffer));
+    // debug_data(buffer,sizeof(buffer));
+   
+}
+
+uint8_t calculate_checksum(uint8_t *data, int length) {
+    uint8_t checksum = 0;
+    for (int i = 0; i < length; i++) {
+        checksum ^= data[i];
+    }
+    return checksum;
+}
+void debug_data(uint8_t *data, size_t length){
+    Serial.print("Sent Frame: ");
+    for (size_t i = 0; i < length; ++i) {
+        if (data[i] < 0x10) Serial.print("0"); // Wyrównanie do 0x0X
+        Serial.print(data[i], HEX);
+        Serial.print(" ");
+    }
+    Serial.println();
 }
