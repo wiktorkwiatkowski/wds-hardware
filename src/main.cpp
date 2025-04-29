@@ -12,20 +12,30 @@
 #define ENCODER_PULSES_PER_REV 16  // Liczba impulsów na pełny obrót enkodera
 #define GEAR_RATIO 9.6             // Przekładnia 9.6
 
-#define START_BYTE 0xA5  // Początek ramki
-#define FRAME_LENGTH 23  // Długość danych w ramce
+#define START_BYTE 0xA5          // Początek ramki
+#define START_BYTE_RECEIVE 0xB5  // Początek ramki odbieranej
+#define FRAME_LENGTH 35          // Długość danych w ramce
 
-// Struktura do przechowywania danych
-struct DataFrame {
-    uint8_t startByte;  // Start byte
-    uint8_t length;     // Długość ramki
-    float rpm;          // Prędkość
-    int pwm;            // PWM
-    float current;      // Prąd
-    float voltage;      // Napięcie
-    float power;        // Moc
-    uint8_t checksum;   // Checksum
+// Długość ramki odbiorczej
+#define RX_FRAME_LENGTH 7
+
+enum DataType : uint8_t {
+    TYPE_PWM = 0x01,
+    TYPE_KP = 0x02,
+    TYPE_KI = 0x03,
+    TYPE_KD = 0x04
+    // Dodaj więcej w razie potrzeby
 };
+
+enum Mode : uint8_t {
+    Manual = 0x00,
+    Automatic = 0x01
+};
+
+// Bufor odbiorczy
+uint8_t rx_buffer[RX_FRAME_LENGTH];
+uint8_t rx_index = 0;
+bool receiving = false;
 
 // Kierunek obrotu
 enum Direction { LEFT, RIGHT };
@@ -53,18 +63,29 @@ float v1_filt = 0;
 float v1_prev = 0;
 float v2_filt = 0;
 float v2_prev = 0;
+int pwr = 0;
+
+float kp = 0;
+float ki = 0;
+float kd = 0;
 
 // PID
 float eintegral = 0;
 float eprev = 0;
 
+unsigned long lastPwrUpdate = 0;
+bool pwrIncreasing = true;
+
 // Deklaracje funkcji
 void read_encoder();
 void IRAM_ATTR set_motor(Direction, int, int, int, int);
-void send_qt_binary(float, int, float, float, float);
-void debug_data(uint8_t *,size_t length);
+void send_qt_binary(float, int, float, float, float, float, float, float, Mode);
+void debug_data(uint8_t *, size_t length);
 // Funkcja obliczająca checksum (XOR wszystkich bajtów)
 uint8_t calculate_checksum(uint8_t *, int);
+void parse_qt_frame(uint8_t *frame);
+void read_qt_binary();
+void simulate_qt_frame_debug();
 
 void setup() {
     Serial.begin(115200);
@@ -78,11 +99,14 @@ void setup() {
     pinMode(IN1, OUTPUT);
     pinMode(IN2, OUTPUT);
     attachInterrupt(digitalPinToInterrupt(ENCODER_AY), read_encoder, RISING);
+    pinMode(2, OUTPUT);
     // ina219.setCalibration_32V_1A();
     delay(500);
 }
 
 void loop() {
+    // simulate_qt_frame_debug();
+    read_qt_binary();
     int pos = 0;
 
     // Odczyt pozycji z zachowaniem bezpieczeństwa przerwań
@@ -108,15 +132,14 @@ void loop() {
     v2_filt = v1_filt;
     v2_prev = v1_prev;
     v1_prev = v1;
-
     // Wartość zadana prędkości (150 RPM sinusoidalnie zmieniana) taki przebieg prostokątny
     float vt = 150 * (sin(curr_t / 1e6) > 0);
     // Serial.print(">v_target:");
     // Serial.println(vt);
     // Parametry PID
-    float kp = 1;
-    float ki = 1;
-    float kd = 0.1;
+    kp = 1;
+    ki = 1;
+    kd = 0.1;
 
     // Obliczenia regulatora PID
     float e = vt - v1_filt;
@@ -132,7 +155,13 @@ void loop() {
     }
 
     // Wartość PWM (ograniczona do 255)
-    int pwr = (int)fabs(u);
+    // pwr = (int)fabs(u);
+
+    // if (millis() - lastPwrUpdate >= 1000) {
+    //     lastPwrUpdate = millis();
+    //     pwr = random(0, 256);
+    // }
+
     if (pwr > 255) {
         pwr = 255;
     }
@@ -174,8 +203,7 @@ void loop() {
     // Serial.println("");
 
     // Transmisja danych do Qt
-    send_qt_binary(v1_filt, pwr, current_mA, load_voltage, power_mW);
-    delay(200);
+    send_qt_binary(v1_filt, pwr, current_mA, load_voltage, power_mW, kp, ki, kd, Mode::Automatic);
 }
 
 /*Czytamy enkoder b jak a będzie miało interupta na rising, jak kręcimy w
@@ -209,40 +237,37 @@ void set_motor(Direction dir, int pwm, int pwm_val, int in1, int in2) {
     }
 }
 
-void send_qt_binary(float rpm, int pwm, float current, float voltage, float power) {
-    // Przygotowanie ramki
-    DataFrame frame;
-    frame.startByte = START_BYTE;
-    frame.length = FRAME_LENGTH;
-    frame.rpm = rpm;
-    frame.pwm = pwm;
-    frame.current = current;
-    frame.voltage = voltage;
-    frame.power = power;
+void send_qt_binary(float rpm, int pwm, float current, float voltage, float power, float k_p, float k_i, float k_d, Mode mode) {
+    
+    uint8_t start_byte = START_BYTE;
+    float f_pwm = static_cast<float>(pwm);
+    
     // 1 + 1 + 5*4 23
     // Zbiór bajtów do wysłania
-    uint8_t buffer[FRAME_LENGTH]; // 23 bajty (start byte + długość + dane + checksum)
+    uint8_t buffer[FRAME_LENGTH];  // 35 bajty (start byte + dane + tryb + checksum)
 
-    // Wartości są zapisywane jako little - endian najmniej znaczący bit pierszy 
     // Kopiowanie danych do bufora
-    memcpy(buffer, &frame.startByte, sizeof(frame.startByte));   // Start byte
-    memcpy(buffer + 1, &frame.length, sizeof(frame.length));     // Długość ramki
-    memcpy(buffer + 2, &frame.rpm, sizeof(frame.rpm));           // RPM
-    memcpy(buffer + 6, &frame.pwm, sizeof(frame.pwm));           // PWM
-    memcpy(buffer + 10, &frame.current, sizeof(frame.current));   // Current
-    memcpy(buffer + 14, &frame.voltage, sizeof(frame.voltage)); // Voltage
-    memcpy(buffer + 18, &frame.power, sizeof(frame.power));     // Power
-
+    memcpy(buffer, &start_byte, sizeof(start_byte));   // Start byte
+    memcpy(buffer + 1, &rpm, sizeof(rpm));           // RPM
+    memcpy(buffer + 5, &f_pwm, sizeof(f_pwm));           // PWM
+    memcpy(buffer + 9, &current, sizeof(current));  // Current
+    memcpy(buffer + 13, &voltage, sizeof(voltage));  // Voltage
+    memcpy(buffer + 17, &power, sizeof(power));      // Power
+    memcpy(buffer + 21, &k_p, sizeof(k_p));
+    memcpy(buffer + 25, &k_i, sizeof(k_i));
+    memcpy(buffer + 29, &k_d, sizeof(k_d));
+    memcpy(buffer + 33, &mode, sizeof(mode));
+    
+    
     // Oblicz checksum
-    frame.checksum = calculate_checksum(buffer, sizeof(buffer) - 1); // -1 aby nie liczyć checksum
+    uint8_t checksum = calculate_checksum(buffer, sizeof(buffer) - 1);  
 
     // Dodanie checksum do ramki
-    memcpy(buffer + sizeof(buffer) - 1, &frame.checksum, sizeof(frame.checksum));
+    memcpy(buffer + 34, &checksum, sizeof(checksum));
 
     // Wysyłanie ramki
     Serial.write(buffer, sizeof(buffer));
     // debug_data(buffer,sizeof(buffer));
-   
 }
 
 uint8_t calculate_checksum(uint8_t *data, int length) {
@@ -252,12 +277,85 @@ uint8_t calculate_checksum(uint8_t *data, int length) {
     }
     return checksum;
 }
-void debug_data(uint8_t *data, size_t length){
+
+void read_qt_binary() {
+    while (Serial.available()) {
+        uint8_t byte = Serial.read();
+
+        if (!receiving) {
+            if (byte == START_BYTE_RECEIVE) {
+                receiving = true;
+                rx_index = 0;
+                rx_buffer[rx_index++] = byte;
+            }
+        } else {
+            if (rx_index < RX_FRAME_LENGTH) {
+                rx_buffer[rx_index++] = byte;
+            }
+
+            if (rx_index >= RX_FRAME_LENGTH) {
+                receiving = false;
+                // Sprawdź checksum
+                uint8_t checksum = calculate_checksum(rx_buffer, sizeof(rx_buffer) - 1);
+                if (checksum == rx_buffer[RX_FRAME_LENGTH - 1]) {
+                    parse_qt_frame(rx_buffer);
+
+                } else {
+                    Serial.println("Błąd: zła suma kontrolna!");
+                }
+            }
+        }
+    }
+}
+
+void parse_qt_frame(uint8_t *frame) {
+    uint8_t type = frame[1];
+    float value;
+    memcpy(&value, frame + 2, sizeof(float));
+
+    switch (type) {
+        case TYPE_PWM:
+            Serial.println(value);
+            pwr = static_cast<int>(value);
+            break;
+        case TYPE_KP:
+            Serial.println(value);
+            // kp = value;
+            break;
+        case TYPE_KI:
+            Serial.println(value);
+            // ki = value;
+            break;
+        case TYPE_KD:
+            Serial.println(value);
+            // kd = value;
+            break;
+        default:
+            Serial.println(type, HEX);
+            break;
+    }
+}
+
+void debug_data(uint8_t *data, size_t length) {
     Serial.print("Sent Frame: ");
     for (size_t i = 0; i < length; ++i) {
-        if (data[i] < 0x10) Serial.print("0"); // Wyrównanie do 0x0X
+        if (data[i] < 0x10) Serial.print("0");  // Wyrównanie do 0x0X
         Serial.print(data[i], HEX);
         Serial.print(" ");
     }
     Serial.println();
+}
+void simulate_qt_frame_debug() {
+    // Ramka: START_BYTE, typ, float(250.0), checksum
+    uint8_t test_frame[7] = {0xB5, 0x01, 0x00, 0x00, 0x7A, 0x43, 0x8D};
+
+    // Oblicz checksum dla kontroli
+    uint8_t checksum = calculate_checksum(test_frame, 6);
+    if (checksum != test_frame[6]) {
+        Serial.println("Uwaga: Błędna suma kontrolna w symulowanej ramce!");
+        Serial.print("Obliczona suma: 0x");
+        Serial.println(checksum, HEX);
+    }
+
+    parse_qt_frame(test_frame);
 }
